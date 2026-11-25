@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sec-ipv6-canon"
+version = "0.1.0"
+description = "IPv6 text canonicalization and prefix containment for access policy"
+requires-python = ">=3.9"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
