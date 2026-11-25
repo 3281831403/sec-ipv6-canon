@@ -11,10 +11,14 @@ import re
 from typing import List, Tuple
 
 _HEX_RE = re.compile(r"\A[0-9A-Fa-f]{1,4}\Z")
-_V4_RE = re.compile(r"\A(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\Z")
+_V4_RE = re.compile(r"\A([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\Z")
 _ZONE_RE = re.compile(r"\A[0-9A-Za-z._~-]+\Z")
 
 _GROUPS = 8
+# The IPv4-mapped block is ::ffff:0:0/96, so an address belongs to it exactly
+# when its high 96 bits equal this value.
+_MAPPED_HIGH = 0xFFFF
+_BITS = 128
 
 
 def _split_zone(text: str) -> Tuple[str, str]:
@@ -37,9 +41,14 @@ def _v4_tokens(part: str) -> List[str]:
     match = _V4_RE.match(part)
     if not match:
         raise ValueError("invalid embedded IPv4 part")
-    octets = [int(piece) for piece in match.groups()]
-    if any(octet > 255 for octet in octets):
-        raise ValueError("IPv4 octet out of range")
+    octets: List[int] = []
+    for piece in match.groups():
+        if len(piece) > 1 and piece[0] == "0":
+            raise ValueError("leading zero in IPv4 octet")
+        octet = int(piece, 10)
+        if octet > 255:
+            raise ValueError("IPv4 octet out of range")
+        octets.append(octet)
     high = (octets[0] << 8) | octets[1]
     low = (octets[2] << 8) | octets[3]
     return ["%x" % high, "%x" % low]
@@ -69,7 +78,13 @@ def _group_tokens(text: str) -> List[str]:
         raise ValueError("empty address")
     if "::" in text:
         halves = text.split("::")
-        head_text, tail_text = halves[0], halves[-1]
+        if len(halves) != 2:
+            raise ValueError("'::' may appear at most once")
+        head_text, tail_text = halves
+        if "." in head_text:
+            # A dotted quad spells the low 32 bits, so it can never sit to the
+            # left of the compressed zero groups.
+            raise ValueError("embedded IPv4 part must be last")
         head = _segment_tokens(head_text) if head_text else []
         tail = _segment_tokens(tail_text) if tail_text else []
         if len(head) + len(tail) > _GROUPS - 1:
@@ -95,18 +110,21 @@ def _is_zero(token: str) -> bool:
 
 def _compressible(length: int) -> bool:
     """Return whether a zero run of the given length is a shortening candidate."""
-    return length >= 1
+    # A single zero group must be written as "0", never as "::".
+    return length >= 2
 
 
 def _label(token: str) -> str:
-    """Return the text used for one group."""
-    stripped = token
-    return stripped or "0"
+    """Return the canonical text used for one group."""
+    return "%x" % int(token, 16)
 
 
 def _longest_zero_run(tokens: List[str]) -> Tuple[int, int]:
-    """Return ``(start, length)`` of the zero run that gets shortened."""
-    runs: List[Tuple[int, int]] = []
+    """Return ``(start, length)`` of the zero run that gets shortened.
+
+    The longest eligible run wins; ties are broken toward the leftmost run.
+    """
+    best_start, best_len = -1, 0
     start = 0
     while start < _GROUPS:
         if not _is_zero(tokens[start]):
@@ -115,12 +133,10 @@ def _longest_zero_run(tokens: List[str]) -> Tuple[int, int]:
         end = start
         while end < _GROUPS and _is_zero(tokens[end]):
             end += 1
-        runs.append((start, end - start))
-        start = end
-    best_start, best_len = -1, 0
-    for start, length in runs:
-        if _compressible(length) and length >= best_len:
+        length = end - start
+        if _compressible(length) and length > best_len:
             best_start, best_len = start, length
+        start = end
     return best_start, best_len
 
 
@@ -130,20 +146,24 @@ def parse(text: str) -> int:
     return _value(_group_tokens(body))
 
 
+def _dotted(value: int) -> str:
+    low = value & 0xFFFFFFFF
+    return "%d.%d.%d.%d" % (
+        (low >> 24) & 0xFF,
+        (low >> 16) & 0xFF,
+        (low >> 8) & 0xFF,
+        low & 0xFF,
+    )
+
+
 def canonical(text: str) -> str:
     """Return the RFC 5952 text of ``text`` without any scope suffix."""
     body, _zone = _split_zone(text)
     tokens = _group_tokens(body)
     value = _value(tokens)
-    if value >> 32 == 0:
-        low = value & 0xFFFFFFFF
-        octets = (
-            (low >> 24) & 0xFF,
-            (low >> 16) & 0xFF,
-            (low >> 8) & 0xFF,
-            low & 0xFF,
-        )
-        return "::%d.%d.%d.%d" % octets
+    if value >> 32 == _MAPPED_HIGH:
+        # Only the IPv4-mapped block is written in dotted form.
+        return "::ffff:" + _dotted(value)
     labels = [_label(token) for token in tokens]
     start, length = _longest_zero_run(tokens)
     if length == 0:
@@ -154,20 +174,22 @@ def canonical(text: str) -> str:
 def _check_prefix_length(plen: int) -> None:
     if isinstance(plen, bool) or not isinstance(plen, int):
         raise TypeError("prefix length must be an integer")
-    if plen <= 0 or plen > 128:
+    if plen < 0 or plen > _BITS:
         raise ValueError("prefix length out of range")
 
 
 def in_prefix(text: str, prefix_text: str, plen: int) -> bool:
-    """Return whether ``text`` is covered by ``prefix_text/plen``."""
+    """Return whether ``text`` is covered by ``prefix_text/plen``.
+
+    Scope suffixes are not part of the address bits and therefore never affect
+    membership.
+    """
     _check_prefix_length(plen)
-    if _split_zone(text)[1] != _split_zone(prefix_text)[1]:
-        return False
     address = parse(text)
     base = parse(prefix_text)
     if plen == 0:
         return True
-    shift = 128 - plen
+    shift = _BITS - plen
     return address >> shift == base >> shift
 
 
@@ -176,10 +198,17 @@ def normalize_zone(text: str) -> str:
     body, zone = _split_zone(text)
     base = canonical(body)
     if zone:
-        return base + "%" + zone.lower()
+        # The scope suffix is opaque and is reproduced exactly as supplied.
+        return base + "%" + zone
     return base
 
 
 def same_host(a: str, b: str) -> bool:
-    """Return whether two texts denote the same host."""
-    return parse(a) == parse(b)
+    """Return whether two texts denote the same host.
+
+    Address bits and the scope suffix both take part in host identity, so a
+    missing scope never equals a supplied one.
+    """
+    body_a, zone_a = _split_zone(a)
+    body_b, zone_b = _split_zone(b)
+    return zone_a == zone_b and _value(_group_tokens(body_a)) == _value(_group_tokens(body_b))
